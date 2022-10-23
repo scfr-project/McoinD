@@ -1,5 +1,5 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2012 The Bitcoin developers
+// Copyright (c) 2013  The curecoin developer
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,9 +8,10 @@
 #include "sync.h"
 #include "ui_interface.h"
 #include "base58.h"
-#include "bitcoinrpc.h"
+#include "curecoinrpc.h"
 #include "db.h"
 
+#undef printf
 #include <boost/asio.hpp>
 #include <boost/asio/ip/v6_only.hpp>
 #include <boost/bind.hpp>
@@ -25,25 +26,24 @@
 #include <boost/shared_ptr.hpp>
 #include <list>
 
+#define printf OutputDebugStringF
+
 using namespace std;
 using namespace boost;
 using namespace boost::asio;
 using namespace json_spirit;
 
-// Key used by getwork/getblocktemplate miners.
-// Allocated in StartRPCThreads, free'd in StopRPCThreads
-CReserveKey* pMiningKey = NULL;
+void ThreadRPCServer2(void* parg);
 
 static std::string strRPCUserColonPass;
 
-// These are created by StartRPCThreads, destroyed in StopRPCThreads
-static asio::io_service* rpc_io_service = NULL;
-static ssl::context* rpc_ssl_context = NULL;
-static boost::thread_group* rpc_worker_group = NULL;
+const Object emptyobj;
+
+void ThreadRPCServer3(void* parg);
 
 static inline unsigned short GetDefaultRPCPort()
 {
-    return 9335;
+    return GetBoolArg("-testnet", false) ? DEF_TESTNET_RPCPORT : DEF_RPCPORT;
 }
 
 Object JSONRPCError(int code, const string& message)
@@ -97,7 +97,7 @@ void RPCTypeCheck(const Object& o,
 int64 AmountFromValue(const Value& value)
 {
     double dAmount = value.get_real();
-    if (dAmount <= 0.0 || dAmount > 21000000.0)
+    if (dAmount <= 0.0 || dAmount > MAX_MONEY)
         throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount");
     int64 nAmount = roundint64(dAmount * COIN);
     if (!MoneyRange(nAmount))
@@ -179,14 +179,16 @@ Value help(const Array& params, bool fHelp)
 
 Value stop(const Array& params, bool fHelp)
 {
-    // Accept the deprecated and ignored 'detach' boolean argument
     if (fHelp || params.size() > 1)
         throw runtime_error(
-            "stop\n"
-            "Stop Mcoin server.");
+            "stop <detach>\n"
+            "<detach> is true or false to detach the database or not for this stop only\n"
+            "Stop curecoin server (and possibly override the detachdb config value).");
     // Shutdown will take long enough that the response should get back
+    if (params.size() > 0)
+        bitdb.SetDetach(params[0].get_bool());
     StartShutdown();
-    return "Mcoin server stopping";
+    return "curecoin server stopping";
 }
 
 
@@ -197,70 +199,75 @@ Value stop(const Array& params, bool fHelp)
 
 
 static const CRPCCommand vRPCCommands[] =
-{ //  name                      actor (function)         okSafeMode threadSafe
-  //  ------------------------  -----------------------  ---------- ----------
-    { "help",                   &help,                   true,      true },
-    { "stop",                   &stop,                   true,      true },
-    { "getblockcount",          &getblockcount,          true,      false },
-    { "getconnectioncount",     &getconnectioncount,     true,      false },
-    { "getpeerinfo",            &getpeerinfo,            true,      false },
-    { "addnode",                &addnode,                true,      true },
-    { "getaddednodeinfo",       &getaddednodeinfo,       true,      true },
-    { "getdifficulty",          &getdifficulty,          true,      false },
-    { "getgenerate",            &getgenerate,            true,      false },
-    { "setgenerate",            &setgenerate,            true,      false },
-    { "gethashespersec",        &gethashespersec,        true,      false },
-    { "getinfo",                &getinfo,                true,      false },
-    { "getmininginfo",          &getmininginfo,          true,      false },
-    { "getnewaddress",          &getnewaddress,          true,      false },
-    { "getaccountaddress",      &getaccountaddress,      true,      false },
-    { "setaccount",             &setaccount,             true,      false },
-    { "getaccount",             &getaccount,             false,     false },
-    { "getaddressesbyaccount",  &getaddressesbyaccount,  true,      false },
-    { "sendtoaddress",          &sendtoaddress,          false,     false },
-    { "getreceivedbyaddress",   &getreceivedbyaddress,   false,     false },
-    { "getreceivedbyaccount",   &getreceivedbyaccount,   false,     false },
-    { "listreceivedbyaddress",  &listreceivedbyaddress,  false,     false },
-    { "listreceivedbyaccount",  &listreceivedbyaccount,  false,     false },
-    { "backupwallet",           &backupwallet,           true,      false },
-    { "keypoolrefill",          &keypoolrefill,          true,      false },
-    { "walletpassphrase",       &walletpassphrase,       true,      false },
-    { "walletpassphrasechange", &walletpassphrasechange, false,     false },
-    { "walletlock",             &walletlock,             true,      false },
-    { "encryptwallet",          &encryptwallet,          false,     false },
-    { "validateaddress",        &validateaddress,        true,      false },
-    { "getbalance",             &getbalance,             false,     false },
-    { "move",                   &movecmd,                false,     false },
-    { "sendfrom",               &sendfrom,               false,     false },
-    { "sendmany",               &sendmany,               false,     false },
-    { "addmultisigaddress",     &addmultisigaddress,     false,     false },
-    { "createmultisig",         &createmultisig,         true,      true  },
-    { "getrawmempool",          &getrawmempool,          true,      false },
-    { "getblock",               &getblock,               false,     false },
-    { "getblockhash",           &getblockhash,           false,     false },
-    { "gettransaction",         &gettransaction,         false,     false },
-    { "listtransactions",       &listtransactions,       false,     false },
-    { "listaddressgroupings",   &listaddressgroupings,   false,     false },
-    { "signmessage",            &signmessage,            false,     false },
-    { "verifymessage",          &verifymessage,          false,     false },
-    { "getwork",                &getwork,                true,      false },
-    { "listaccounts",           &listaccounts,           false,     false },
-    { "settxfee",               &settxfee,               false,     false },
-    { "getblocktemplate",       &getblocktemplate,       true,      false },
-    { "submitblock",            &submitblock,            false,     false },
-    { "listsinceblock",         &listsinceblock,         false,     false },
-    { "dumpprivkey",            &dumpprivkey,            true,      false },
-    { "importprivkey",          &importprivkey,          false,     false },
-    { "listunspent",            &listunspent,            false,     false },
-    { "getrawtransaction",      &getrawtransaction,      false,     false },
-    { "createrawtransaction",   &createrawtransaction,   false,     false },
-    { "decoderawtransaction",   &decoderawtransaction,   false,     false },
-    { "signrawtransaction",     &signrawtransaction,     false,     false },
-    { "sendrawtransaction",     &sendrawtransaction,     false,     false },
-    { "gettxoutsetinfo",        &gettxoutsetinfo,        true,      false },
-    { "gettxout",               &gettxout,               true,      false },
-    { "lockunspent",            &lockunspent,            false,     false },
-    { "listlockunspent",        &listlockunspent,        false,     false },
+{ //  name                      function                 safemd  unlocked
+  //  ------------------------  -----------------------  ------  --------
+    { "help",                   &help,                   true,   true },
+    { "stop",                   &stop,                   true,   true },
+    { "getblockcount",          &getblockcount,          true,   false },
+    { "getconnectioncount",     &getconnectioncount,     true,   false },
+    { "getpeerinfo",            &getpeerinfo,            true,   false },
+    { "getdifficulty",          &getdifficulty,          true,   false },
+    { "getgenerate",            &getgenerate,            true,   false },
+    { "setgenerate",            &setgenerate,            true,   false },
+    { "gethashespersec",        &gethashespersec,        true,   false },
+    { "getinfo",                &getinfo,                true,   false },
+    { "getmininginfo",          &getmininginfo,          true,   false },
+    { "getnetworkhashps",       &getnetworkhashps,       true,   false },
+    { "getnewaddress",          &getnewaddress,          true,   false },
+    { "getnewpubkey",           &getnewpubkey,           true,   false },
+    { "getaccountaddress",      &getaccountaddress,      true,   false },
+    { "setaccount",             &setaccount,             true,   false },
+    { "getaccount",             &getaccount,             false,  false },
+    { "getaddressesbyaccount",  &getaddressesbyaccount,  true,   false },
+    { "sendtoaddress",          &sendtoaddress,          false,  false },
+    { "getreceivedbyaddress",   &getreceivedbyaddress,   false,  false },
+    { "getreceivedbyaccount",   &getreceivedbyaccount,   false,  false },
+    { "listreceivedbyaddress",  &listreceivedbyaddress,  false,  false },
+    { "listreceivedbyaccount",  &listreceivedbyaccount,  false,  false },
+    { "backupwallet",           &backupwallet,           true,   false },
+    { "keypoolrefill",          &keypoolrefill,          true,   false },
+    { "walletpassphrase",       &walletpassphrase,       true,   false },
+    { "walletpassphrasechange", &walletpassphrasechange, false,  false },
+    { "walletlock",             &walletlock,             true,   false },
+    { "encryptwallet",          &encryptwallet,          false,  false },
+    { "validateaddress",        &validateaddress,        true,   false },
+    { "validatepubkey",         &validatepubkey,         true,   false },
+    { "getbalance",             &getbalance,             false,  false },
+    { "move",                   &movecmd,                false,  false },
+    { "sendfrom",               &sendfrom,               false,  false },
+    { "sendmany",               &sendmany,               false,  false },
+    { "addmultisigaddress",     &addmultisigaddress,     false,  false },
+    { "getrawmempool",          &getrawmempool,          true,   false },
+    { "getblock",               &getblock,               false,  false },
+    { "getblockbynumber",       &getblockbynumber,       false,  false },
+    { "getblockhash",           &getblockhash,           false,  false },
+    { "gettransaction",         &gettransaction,         false,  false },
+    { "listtransactions",       &listtransactions,       false,  false },
+    { "listaddressgroupings",   &listaddressgroupings,   false,  false },
+    { "signmessage",            &signmessage,            false,  false },
+    { "verifymessage",          &verifymessage,          false,  false },
+    { "getwork",                &getwork,                true,   false },
+    { "getworkex",              &getworkex,              true,   false },
+    { "listaccounts",           &listaccounts,           false,  false },
+    { "settxfee",               &settxfee,               false,  false },
+    { "getblocktemplate",       &getblocktemplate,       true,   false },
+    { "submitblock",            &submitblock,            false,  false },
+    { "listsinceblock",         &listsinceblock,         false,  false },
+    { "dumpprivkey",            &dumpprivkey,            false,  false },
+    { "importprivkey",          &importprivkey,          false,  false },
+    { "listunspent",            &listunspent,            false,  false },
+    { "getrawtransaction",      &getrawtransaction,      false,  false },
+    { "createrawtransaction",   &createrawtransaction,   false,  false },
+    { "decoderawtransaction",   &decoderawtransaction,   false,  false },
+    { "signrawtransaction",     &signrawtransaction,     false,  false },
+    { "sendrawtransaction",     &sendrawtransaction,     false,  false },
+    { "getcheckpoint",          &getcheckpoint,          true,   false },
+    { "reservebalance",         &reservebalance,         false,  true},
+    { "checkwallet",            &checkwallet,            false,  true},
+    { "repairwallet",           &repairwallet,           false,  true},
+    { "resendtx",               &resendtx,               false,  true},
+    { "makekeypair",            &makekeypair,            false,  true},
+    { "sendalert",              &sendalert,              false,  false},
 };
 
 CRPCTable::CRPCTable()
@@ -294,7 +301,7 @@ string HTTPPost(const string& strMsg, const map<string,string>& mapRequestHeader
 {
     ostringstream s;
     s << "POST / HTTP/1.1\r\n"
-      << "User-Agent: mcoin-json-rpc/" << FormatFullVersion() << "\r\n"
+      << "User-Agent: curecoin-json-rpc/" << FormatFullVersion() << "\r\n"
       << "Host: 127.0.0.1\r\n"
       << "Content-Type: application/json\r\n"
       << "Content-Length: " << strMsg.size() << "\r\n"
@@ -325,7 +332,7 @@ static string HTTPReply(int nStatus, const string& strMsg, bool keepalive)
     if (nStatus == HTTP_UNAUTHORIZED)
         return strprintf("HTTP/1.0 401 Authorization Required\r\n"
             "Date: %s\r\n"
-            "Server: mcoin-json-rpc/%s\r\n"
+            "Server: curecoin-json-rpc/%s\r\n"
             "WWW-Authenticate: Basic realm=\"jsonrpc\"\r\n"
             "Content-Type: text/html\r\n"
             "Content-Length: 296\r\n"
@@ -352,7 +359,7 @@ static string HTTPReply(int nStatus, const string& strMsg, bool keepalive)
             "Connection: %s\r\n"
             "Content-Length: %"PRIszu"\r\n"
             "Content-Type: application/json\r\n"
-            "Server: mcoin-json-rpc/%s\r\n"
+            "Server: curecoin-json-rpc/%s\r\n"
             "\r\n"
             "%s",
         nStatus,
@@ -362,41 +369,6 @@ static string HTTPReply(int nStatus, const string& strMsg, bool keepalive)
         strMsg.size(),
         FormatFullVersion().c_str(),
         strMsg.c_str());
-}
-
-bool ReadHTTPRequestLine(std::basic_istream<char>& stream, int &proto,
-                         string& http_method, string& http_uri)
-{
-    string str;
-    getline(stream, str);
-
-    // HTTP request line is space-delimited
-    vector<string> vWords;
-    boost::split(vWords, str, boost::is_any_of(" "));
-    if (vWords.size() < 2)
-        return false;
-
-    // HTTP methods permitted: GET, POST
-    http_method = vWords[0];
-    if (http_method != "GET" && http_method != "POST")
-        return false;
-
-    // HTTP URI must be an absolute path, relative to current host
-    http_uri = vWords[1];
-    if (http_uri.size() == 0 || http_uri[0] != '/')
-        return false;
-
-    // parse proto, if present
-    string strProto = "";
-    if (vWords.size() > 2)
-        strProto = vWords[2];
-
-    proto = 0;
-    const char *ver = strstr(strProto.c_str(), "HTTP/1.");
-    if (ver != NULL)
-        proto = atoi(ver+7);
-
-    return true;
 }
 
 int ReadHTTPStatus(std::basic_istream<char>& stream, int &proto)
@@ -414,10 +386,10 @@ int ReadHTTPStatus(std::basic_istream<char>& stream, int &proto)
     return atoi(vWords[1].c_str());
 }
 
-int ReadHTTPHeaders(std::basic_istream<char>& stream, map<string, string>& mapHeadersRet)
+int ReadHTTPHeader(std::basic_istream<char>& stream, map<string, string>& mapHeadersRet)
 {
     int nLen = 0;
-    loop
+    while (true)
     {
         string str;
         std::getline(stream, str);
@@ -439,15 +411,17 @@ int ReadHTTPHeaders(std::basic_istream<char>& stream, map<string, string>& mapHe
     return nLen;
 }
 
-int ReadHTTPMessage(std::basic_istream<char>& stream, map<string,
-                    string>& mapHeadersRet, string& strMessageRet,
-                    int nProto)
+int ReadHTTP(std::basic_istream<char>& stream, map<string, string>& mapHeadersRet, string& strMessageRet)
 {
     mapHeadersRet.clear();
     strMessageRet = "";
 
+    // Read status
+    int nProto = 0;
+    int nStatus = ReadHTTPStatus(stream, nProto);
+
     // Read header
-    int nLen = ReadHTTPHeaders(stream, mapHeadersRet);
+    int nLen = ReadHTTPHeader(stream, mapHeadersRet);
     if (nLen < 0 || nLen > (int)MAX_SIZE)
         return HTTP_INTERNAL_SERVER_ERROR;
 
@@ -469,7 +443,7 @@ int ReadHTTPMessage(std::basic_istream<char>& stream, map<string,
             mapHeadersRet["connection"] = "close";
     }
 
-    return HTTP_OK;
+    return nStatus;
 }
 
 bool HTTPAuthorized(map<string, string>& mapHeaders)
@@ -479,11 +453,11 @@ bool HTTPAuthorized(map<string, string>& mapHeaders)
         return false;
     string strUserPass64 = strAuth.substr(6); boost::trim(strUserPass64);
     string strUserPass = DecodeBase64(strUserPass64);
-    return TimingResistantEqual(strUserPass, strRPCUserColonPass);
+    return strUserPass == strRPCUserColonPass;
 }
 
 //
-// JSON-RPC protocol.  Bitcoin speaks version 1.0 for maximum compatibility,
+// JSON-RPC protocol.  curecoin speaks version 1.0 for maximum compatibility,
 // but uses JSON-RPC 1.1/2.0 standards for parts of the 1.0 standard that were
 // unspecified (HTTP errors and contents of 'error').
 //
@@ -585,7 +559,7 @@ public:
     }
     bool connect(const std::string& server, const std::string& port)
     {
-        ip::tcp::resolver resolver(stream.get_io_service());
+        ip::tcp::resolver resolver(GetIOService(stream));
         ip::tcp::resolver::query query(server.c_str(), port.c_str());
         ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
         ip::tcp::resolver::iterator end;
@@ -653,7 +627,26 @@ private:
     iostreams::stream< SSLIOStreamDevice<Protocol> > _stream;
 };
 
-void ServiceConnection(AcceptedConnection *conn);
+void ThreadRPCServer(void* parg)
+{
+    // Make this thread recognisable as the RPC listener
+    RenameThread("curecoin-rpclist");
+
+    try
+    {
+        vnThreadsRunning[THREAD_RPCLISTENER]++;
+        ThreadRPCServer2(parg);
+        vnThreadsRunning[THREAD_RPCLISTENER]--;
+    }
+    catch (std::exception& e) {
+        vnThreadsRunning[THREAD_RPCLISTENER]--;
+        PrintException(&e, "ThreadRPCServer()");
+    } catch (...) {
+        vnThreadsRunning[THREAD_RPCLISTENER]--;
+        PrintException(NULL, "ThreadRPCServer()");
+    }
+    printf("ThreadRPCServer exited\n");
+}
 
 // Forward declaration required for RPCListen
 template <typename Protocol, typename SocketAcceptorService>
@@ -672,7 +665,7 @@ static void RPCListen(boost::shared_ptr< basic_socket_acceptor<Protocol, SocketA
                    const bool fUseSSL)
 {
     // Accept connection
-    AcceptedConnectionImpl<Protocol>* conn = new AcceptedConnectionImpl<Protocol>(acceptor->get_io_service(), context, fUseSSL);
+    AcceptedConnectionImpl<Protocol>* conn = new AcceptedConnectionImpl<Protocol>(GetIOServiceFromPtr(acceptor), context, fUseSSL);
 
     acceptor->async_accept(
             conn->sslStream.lowest_layer(),
@@ -695,8 +688,11 @@ static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol, 
                              AcceptedConnection* conn,
                              const boost::system::error_code& error)
 {
+    vnThreadsRunning[THREAD_RPCLISTENER]++;
+
     // Immediately start accepting new connections, except when we're cancelled or our socket is closed.
-    if (error != asio::error::operation_aborted && acceptor->is_open())
+    if (error != asio::error::operation_aborted
+     && acceptor->is_open())
         RPCListen(acceptor, context, fUseSSL);
 
     AcceptedConnectionImpl<ip::tcp>* tcp_conn = dynamic_cast< AcceptedConnectionImpl<ip::tcp>* >(conn);
@@ -710,77 +706,74 @@ static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol, 
     // Restrict callers by IP.  It is important to
     // do this before starting client thread, to filter out
     // certain DoS and misbehaving clients.
-    else if (tcp_conn && !ClientAllowed(tcp_conn->peer.address()))
+    else if (tcp_conn
+          && !ClientAllowed(tcp_conn->peer.address()))
     {
         // Only send a 403 if we're not using SSL to prevent a DoS during the SSL handshake.
         if (!fUseSSL)
             conn->stream() << HTTPReply(HTTP_FORBIDDEN, "", false) << std::flush;
         delete conn;
     }
-    else {
-        ServiceConnection(conn);
-        conn->close();
+
+    // start HTTP client thread
+    else if (!NewThread(ThreadRPCServer3, conn)) {
+        printf("Failed to create RPC server client thread\n");
         delete conn;
     }
+
+    vnThreadsRunning[THREAD_RPCLISTENER]--;
 }
 
-void StartRPCThreads()
+void ThreadRPCServer2(void* parg)
 {
-    // getwork/getblocktemplate mining rewards paid here:
-    pMiningKey = new CReserveKey(pwalletMain);
+    printf("ThreadRPCServer started\n");
 
     strRPCUserColonPass = mapArgs["-rpcuser"] + ":" + mapArgs["-rpcpassword"];
-    if ((mapArgs["-rpcpassword"] == "") ||
-        (mapArgs["-rpcuser"] == mapArgs["-rpcpassword"]))
+    if (mapArgs["-rpcpassword"] == "")
     {
         unsigned char rand_pwd[32];
         RAND_bytes(rand_pwd, 32);
-        string strWhatAmI = "To use mcoind";
+        string strWhatAmI = "To use curecoind";
         if (mapArgs.count("-server"))
             strWhatAmI = strprintf(_("To use the %s option"), "\"-server\"");
         else if (mapArgs.count("-daemon"))
             strWhatAmI = strprintf(_("To use the %s option"), "\"-daemon\"");
         uiInterface.ThreadSafeMessageBox(strprintf(
-            _("%s, you must set a rpcpassword in the configuration file:\n"
-              "%s\n"
+            _("%s, you must set a rpcpassword in the configuration file:\n %s\n"
               "It is recommended you use the following random password:\n"
-              "rpcuser=mcoinrpc\n"
+              "rpcuser=curecoinrpc\n"
               "rpcpassword=%s\n"
               "(you do not need to remember this password)\n"
-              "The username and password MUST NOT be the same.\n"
-              "If the file does not exist, create it with owner-readable-only file permissions.\n"
-              "It is also recommended to set alertnotify so you are notified of problems;\n"
-              "for example: alertnotify=echo %%s | mail -s \"Mcoin Alert\" admin@foo.com\n"),
+              "If the file does not exist, create it with owner-readable-only file permissions.\n"),
                 strWhatAmI.c_str(),
                 GetConfigFile().string().c_str(),
                 EncodeBase58(&rand_pwd[0],&rand_pwd[0]+32).c_str()),
-                "", CClientUIInterface::MSG_ERROR);
+            _("Error"), CClientUIInterface::OK | CClientUIInterface::MODAL);
         StartShutdown();
         return;
     }
 
-    assert(rpc_io_service == NULL);
-    rpc_io_service = new asio::io_service();
-    rpc_ssl_context = new ssl::context(*rpc_io_service, ssl::context::sslv23);
-
     const bool fUseSSL = GetBoolArg("-rpcssl");
 
+    asio::io_service io_service;
+
+    ssl::context context(ssl::context::sslv23);
     if (fUseSSL)
     {
-        rpc_ssl_context->set_options(ssl::context::no_sslv2);
+        context.set_options(ssl::context::no_sslv2);
 
         filesystem::path pathCertFile(GetArg("-rpcsslcertificatechainfile", "server.cert"));
         if (!pathCertFile.is_complete()) pathCertFile = filesystem::path(GetDataDir()) / pathCertFile;
-        if (filesystem::exists(pathCertFile)) rpc_ssl_context->use_certificate_chain_file(pathCertFile.string());
+        if (filesystem::exists(pathCertFile)) context.use_certificate_chain_file(pathCertFile.string());
         else printf("ThreadRPCServer ERROR: missing server certificate file %s\n", pathCertFile.string().c_str());
 
         filesystem::path pathPKFile(GetArg("-rpcsslprivatekeyfile", "server.pem"));
         if (!pathPKFile.is_complete()) pathPKFile = filesystem::path(GetDataDir()) / pathPKFile;
-        if (filesystem::exists(pathPKFile)) rpc_ssl_context->use_private_key_file(pathPKFile.string(), ssl::context::pem);
+        if (filesystem::exists(pathPKFile)) context.use_private_key_file(pathPKFile.string(), ssl::context::pem);
         else printf("ThreadRPCServer ERROR: missing server private key file %s\n", pathPKFile.string().c_str());
 
         string strCiphers = GetArg("-rpcsslciphers", "TLSv1+HIGH:!SSLv2:!aNULL:!eNULL:!AH:!3DES:@STRENGTH");
-        SSL_CTX_set_cipher_list(rpc_ssl_context->impl(), strCiphers.c_str());
+        SSL_CTX_set_cipher_list(context.native_handle(), strCiphers.c_str());
     }
 
     // Try a dual IPv6/IPv4 socket, falling back to separate IPv4 and IPv6 sockets
@@ -788,7 +781,9 @@ void StartRPCThreads()
     asio::ip::address bindAddress = loopback ? asio::ip::address_v6::loopback() : asio::ip::address_v6::any();
     ip::tcp::endpoint endpoint(bindAddress, GetArg("-rpcport", GetDefaultRPCPort()));
     boost::system::error_code v6_only_error;
-    boost::shared_ptr<ip::tcp::acceptor> acceptor(new ip::tcp::acceptor(*rpc_io_service));
+    boost::shared_ptr<ip::tcp::acceptor> acceptor(new ip::tcp::acceptor(io_service));
+
+    boost::signals2::signal<void ()> StopRequests;
 
     bool fListening = false;
     std::string strerr;
@@ -803,7 +798,11 @@ void StartRPCThreads()
         acceptor->bind(endpoint);
         acceptor->listen(socket_base::max_connections);
 
-        RPCListen(acceptor, *rpc_ssl_context, fUseSSL);
+        RPCListen(acceptor, context, fUseSSL);
+        // Cancel outstanding listen-requests for this acceptor when shutting down
+        StopRequests.connect(signals2::slot<void ()>(
+                    static_cast<void (ip::tcp::acceptor::*)()>(&ip::tcp::acceptor::close), acceptor.get())
+                .track(acceptor));
 
         fListening = true;
     }
@@ -819,13 +818,17 @@ void StartRPCThreads()
             bindAddress = loopback ? asio::ip::address_v4::loopback() : asio::ip::address_v4::any();
             endpoint.address(bindAddress);
 
-            acceptor.reset(new ip::tcp::acceptor(*rpc_io_service));
+            acceptor.reset(new ip::tcp::acceptor(io_service));
             acceptor->open(endpoint.protocol());
             acceptor->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
             acceptor->bind(endpoint);
             acceptor->listen(socket_base::max_connections);
 
-            RPCListen(acceptor, *rpc_ssl_context, fUseSSL);
+            RPCListen(acceptor, context, fUseSSL);
+            // Cancel outstanding listen-requests for this acceptor when shutting down
+            StopRequests.connect(signals2::slot<void ()>(
+                        static_cast<void (ip::tcp::acceptor::*)()>(&ip::tcp::acceptor::close), acceptor.get())
+                    .track(acceptor));
 
             fListening = true;
         }
@@ -836,27 +839,16 @@ void StartRPCThreads()
     }
 
     if (!fListening) {
-        uiInterface.ThreadSafeMessageBox(strerr, "", CClientUIInterface::MSG_ERROR);
+        uiInterface.ThreadSafeMessageBox(strerr, _("Error"), CClientUIInterface::OK | CClientUIInterface::MODAL);
         StartShutdown();
         return;
     }
 
-    rpc_worker_group = new boost::thread_group();
-    for (int i = 0; i < GetArg("-rpcthreads", 4); i++)
-        rpc_worker_group->create_thread(boost::bind(&asio::io_service::run, rpc_io_service));
-}
-
-void StopRPCThreads()
-{
-    delete pMiningKey; pMiningKey = NULL;
-
-    if (rpc_io_service == NULL) return;
-
-    rpc_io_service->stop();
-    rpc_worker_group->join_all();
-    delete rpc_worker_group; rpc_worker_group = NULL;
-    delete rpc_ssl_context; rpc_ssl_context = NULL;
-    delete rpc_io_service; rpc_io_service = NULL;
+    vnThreadsRunning[THREAD_RPCLISTENER]--;
+    while (!fShutdown)
+        io_service.run_one();
+    vnThreadsRunning[THREAD_RPCLISTENER]++;
+    StopRequests();
 }
 
 class JSONRequest
@@ -933,26 +925,35 @@ static string JSONRPCExecBatch(const Array& vReq)
     return write_string(Value(ret), false) + "\n";
 }
 
-void ServiceConnection(AcceptedConnection *conn)
+static CCriticalSection cs_THREAD_RPCHANDLER;
+
+void ThreadRPCServer3(void* parg)
 {
-    bool fRun = true;
-    while (fRun)
+    // Make this thread recognisable as the RPC handler
+    RenameThread("curecoin-rpchand");
+
     {
-        int nProto = 0;
-        map<string, string> mapHeaders;
-        string strRequest, strMethod, strURI;
+        LOCK(cs_THREAD_RPCHANDLER);
+        vnThreadsRunning[THREAD_RPCHANDLER]++;
+    }
+    AcceptedConnection *conn = (AcceptedConnection *) parg;
 
-        // Read HTTP request line
-        if (!ReadHTTPRequestLine(conn->stream(), nProto, strMethod, strURI))
-            break;
-
-        // Read HTTP message headers and body
-        ReadHTTPMessage(conn->stream(), mapHeaders, strRequest, nProto);
-
-        if (strURI != "/") {
-            conn->stream() << HTTPReply(HTTP_NOT_FOUND, "", false) << std::flush;
-            break;
+    bool fRun = true;
+    while (true) {
+        if (fShutdown || !fRun)
+        {
+            conn->close();
+            delete conn;
+            {
+                LOCK(cs_THREAD_RPCHANDLER);
+                --vnThreadsRunning[THREAD_RPCHANDLER];
+            }
+            return;
         }
+        map<string, string> mapHeaders;
+        string strRequest;
+
+        ReadHTTP(conn->stream(), mapHeaders, strRequest);
 
         // Check authorization
         if (mapHeaders.count("authorization") == 0)
@@ -967,7 +968,7 @@ void ServiceConnection(AcceptedConnection *conn)
                If this results in a DOS the user really
                shouldn't have their RPC port exposed.*/
             if (mapArgs["-rpcpassword"].size() < 20)
-                MilliSleep(250);
+                Sleep(250);
 
             conn->stream() << HTTPReply(HTTP_UNAUTHORIZED, "", false) << std::flush;
             break;
@@ -1013,6 +1014,12 @@ void ServiceConnection(AcceptedConnection *conn)
             break;
         }
     }
+
+    delete conn;
+    {
+        LOCK(cs_THREAD_RPCHANDLER);
+        vnThreadsRunning[THREAD_RPCHANDLER]--;
+    }
 }
 
 json_spirit::Value CRPCTable::execute(const std::string &strMethod, const json_spirit::Array &params) const
@@ -1033,7 +1040,7 @@ json_spirit::Value CRPCTable::execute(const std::string &strMethod, const json_s
         // Execute
         Value result;
         {
-            if (pcmd->threadSafe)
+            if (pcmd->unlocked)
                 result = pcmd->actor(params, false);
             else {
                 LOCK2(cs_main, pwalletMain->cs_wallet);
@@ -1060,7 +1067,7 @@ Object CallRPC(const string& strMethod, const Array& params)
     // Connect to localhost
     bool fUseSSL = GetBoolArg("-rpcssl");
     asio::io_service io_service;
-    ssl::context context(io_service, ssl::context::sslv23);
+    ssl::context context(ssl::context::sslv23);
     context.set_options(ssl::context::no_sslv2);
     asio::ssl::stream<asio::ip::tcp::socket> sslStream(io_service, context);
     SSLIOStreamDevice<asio::ip::tcp> d(sslStream, fUseSSL);
@@ -1078,15 +1085,10 @@ Object CallRPC(const string& strMethod, const Array& params)
     string strPost = HTTPPost(strRequest, mapRequestHeaders);
     stream << strPost << std::flush;
 
-    // Receive HTTP reply status
-    int nProto = 0;
-    int nStatus = ReadHTTPStatus(stream, nProto);
-
-    // Receive HTTP reply message headers and body
+    // Receive reply
     map<string, string> mapHeaders;
     string strReply;
-    ReadHTTPMessage(stream, mapHeaders, strReply, nProto);
-
+    int nStatus = ReadHTTP(stream, mapHeaders, strReply);
     if (nStatus == HTTP_UNAUTHORIZED)
         throw runtime_error("incorrect rpcuser or rpcpassword (authorization failed)");
     else if (nStatus >= 400 && nStatus != HTTP_BAD_REQUEST && nStatus != HTTP_NOT_FOUND && nStatus != HTTP_INTERNAL_SERVER_ERROR)
@@ -1142,10 +1144,10 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     // Special case non-string parameter types
     //
     if (strMethod == "stop"                   && n > 0) ConvertTo<bool>(params[0]);
-    if (strMethod == "getaddednodeinfo"       && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "setgenerate"            && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "setgenerate"            && n > 1) ConvertTo<boost::int64_t>(params[1]);
     if (strMethod == "sendtoaddress"          && n > 1) ConvertTo<double>(params[1]);
+    if (strMethod == "getnetworkhashps"       && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "settxfee"               && n > 0) ConvertTo<double>(params[0]);
     if (strMethod == "getreceivedbyaddress"   && n > 1) ConvertTo<boost::int64_t>(params[1]);
     if (strMethod == "getreceivedbyaccount"   && n > 1) ConvertTo<boost::int64_t>(params[1]);
@@ -1154,6 +1156,9 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "listreceivedbyaccount"  && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "listreceivedbyaccount"  && n > 1) ConvertTo<bool>(params[1]);
     if (strMethod == "getbalance"             && n > 1) ConvertTo<boost::int64_t>(params[1]);
+    if (strMethod == "getblock"               && n > 1) ConvertTo<bool>(params[1]);
+    if (strMethod == "getblockbynumber"       && n > 0) ConvertTo<boost::int64_t>(params[0]);
+    if (strMethod == "getblockbynumber"       && n > 1) ConvertTo<bool>(params[1]);
     if (strMethod == "getblockhash"           && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "move"                   && n > 2) ConvertTo<double>(params[2]);
     if (strMethod == "move"                   && n > 3) ConvertTo<boost::int64_t>(params[3]);
@@ -1163,14 +1168,15 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "listtransactions"       && n > 2) ConvertTo<boost::int64_t>(params[2]);
     if (strMethod == "listaccounts"           && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "walletpassphrase"       && n > 1) ConvertTo<boost::int64_t>(params[1]);
+    if (strMethod == "walletpassphrase"       && n > 2) ConvertTo<bool>(params[2]);
     if (strMethod == "getblocktemplate"       && n > 0) ConvertTo<Object>(params[0]);
     if (strMethod == "listsinceblock"         && n > 1) ConvertTo<boost::int64_t>(params[1]);
     if (strMethod == "sendmany"               && n > 1) ConvertTo<Object>(params[1]);
     if (strMethod == "sendmany"               && n > 2) ConvertTo<boost::int64_t>(params[2]);
+    if (strMethod == "reservebalance"          && n > 0) ConvertTo<bool>(params[0]);
+    if (strMethod == "reservebalance"          && n > 1) ConvertTo<double>(params[1]);
     if (strMethod == "addmultisigaddress"     && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "addmultisigaddress"     && n > 1) ConvertTo<Array>(params[1]);
-    if (strMethod == "createmultisig"         && n > 0) ConvertTo<boost::int64_t>(params[0]);
-    if (strMethod == "createmultisig"         && n > 1) ConvertTo<Array>(params[1]);
     if (strMethod == "listunspent"            && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "listunspent"            && n > 1) ConvertTo<boost::int64_t>(params[1]);
     if (strMethod == "listunspent"            && n > 2) ConvertTo<Array>(params[2]);
@@ -1179,11 +1185,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "createrawtransaction"   && n > 1) ConvertTo<Object>(params[1]);
     if (strMethod == "signrawtransaction"     && n > 1) ConvertTo<Array>(params[1], true);
     if (strMethod == "signrawtransaction"     && n > 2) ConvertTo<Array>(params[2], true);
-    if (strMethod == "gettxout"               && n > 1) ConvertTo<boost::int64_t>(params[1]);
-    if (strMethod == "gettxout"               && n > 2) ConvertTo<bool>(params[2]);
-    if (strMethod == "lockunspent"            && n > 0) ConvertTo<bool>(params[0]);
-    if (strMethod == "lockunspent"            && n > 1) ConvertTo<Array>(params[1]);
-    if (strMethod == "importprivkey"          && n > 2) ConvertTo<bool>(params[2]);
 
     return params;
 }
@@ -1235,14 +1236,13 @@ int CommandLineRPC(int argc, char *argv[])
                 strPrint = write_string(result, true);
         }
     }
-    catch (boost::thread_interrupted) {
-        throw;
-    }
-    catch (std::exception& e) {
+    catch (std::exception& e)
+    {
         strPrint = string("error: ") + e.what();
         nRet = 87;
     }
-    catch (...) {
+    catch (...)
+    {
         PrintException(NULL, "CommandLineRPC()");
     }
 
@@ -1279,9 +1279,6 @@ int main(int argc, char *argv[])
         {
             return CommandLineRPC(argc, argv);
         }
-    }
-    catch (boost::thread_interrupted) {
-        throw;
     }
     catch (std::exception& e) {
         PrintException(&e, "main()");

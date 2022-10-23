@@ -1,591 +1,220 @@
-// Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2010 Satoshi Nakamoto
 // Copyright (c) 2013  The curecoin developer
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
-#ifndef curecoin_BIGNUM_H
-#define curecoin_BIGNUM_H
 
-#include <stdexcept>
-#include <vector>
-#include <openssl/bn.h>
+#ifndef _curecoinRPC_H_
+#define _curecoinRPC_H_ 1
 
-#include "util.h" // for uint64
+#include <string>
+#include <list>
+#include <map>
 
-/** Errors thrown by the bignum class */
-class bignum_error : public std::runtime_error
+class CBlockIndex;
+
+#include "json/json_spirit_reader_template.h"
+#include "json/json_spirit_writer_template.h"
+#include "json/json_spirit_utils.h"
+
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include "util.h"
+#include "checkpoints.h"
+
+ // Boost Support for 1.70+
+#if BOOST_VERSION >= 107000
+    #define GetIOService(s) ((boost::asio::io_context&)(s).get_executor().context())
+    #define GetIOServiceFromPtr(s) ((boost::asio::io_context&)(s->get_executor().context())) // this one
+    typedef boost::asio::io_context ioContext;
+
+#else
+    #define GetIOService(s) ((s).get_io_service())
+    #define GetIOServiceFromPtr(s) ((s)->get_io_service())
+    typedef boost::asio::io_service ioContext;
+#endif
+
+// HTTP status codes
+enum HTTPStatusCode
 {
-public:
-    explicit bignum_error(const std::string& str) : std::runtime_error(str) {}
+    HTTP_OK                    = 200,
+    HTTP_BAD_REQUEST           = 400,
+    HTTP_UNAUTHORIZED          = 401,
+    HTTP_FORBIDDEN             = 403,
+    HTTP_NOT_FOUND             = 404,
+    HTTP_INTERNAL_SERVER_ERROR = 500,
 };
 
-
-/** RAII encapsulated BN_CTX (OpenSSL bignum context) */
-class CAutoBN_CTX
+// curecoin RPC error codes
+enum RPCErrorCode
 {
-protected:
-    BN_CTX* pctx;
-    BN_CTX* operator=(BN_CTX* pnew) { return pctx = pnew; }
+    // Standard JSON-RPC 2.0 errors
+    RPC_INVALID_REQUEST  = -32600,
+    RPC_METHOD_NOT_FOUND = -32601,
+    RPC_INVALID_PARAMS   = -32602,
+    RPC_INTERNAL_ERROR   = -32603,
+    RPC_PARSE_ERROR      = -32700,
 
-public:
-    CAutoBN_CTX()
-    {
-        pctx = BN_CTX_new();
-        if (pctx == NULL)
-            throw bignum_error("CAutoBN_CTX : BN_CTX_new() returned NULL");
-    }
+    // General application defined errors
+    RPC_MISC_ERROR                  = -1,  // std::exception thrown in command handling
+    RPC_FORBIDDEN_BY_SAFE_MODE      = -2,  // Server is in safe mode, and command is not allowed in safe mode
+    RPC_TYPE_ERROR                  = -3,  // Unexpected type was passed as parameter
+    RPC_INVALID_ADDRESS_OR_KEY      = -5,  // Invalid address or key
+    RPC_OUT_OF_MEMORY               = -7,  // Ran out of memory during operation
+    RPC_INVALID_PARAMETER           = -8,  // Invalid, missing or duplicate parameter
+    RPC_DATABASE_ERROR              = -20, // Database error
+    RPC_DESERIALIZATION_ERROR       = -22, // Error parsing or validating structure in raw format
 
-    ~CAutoBN_CTX()
-    {
-        if (pctx != NULL)
-            BN_CTX_free(pctx);
-    }
+    // P2P client errors
+    RPC_CLIENT_NOT_CONNECTED        = -9,  // curecoin is not connected
+    RPC_CLIENT_IN_INITIAL_DOWNLOAD  = -10, // Still downloading initial blocks
 
-    operator BN_CTX*() { return pctx; }
-    BN_CTX& operator*() { return *pctx; }
-    BN_CTX** operator&() { return &pctx; }
-    bool operator!() { return (pctx == NULL); }
+    // Wallet errors
+    RPC_WALLET_ERROR                = -4,  // Unspecified problem with wallet (key not found etc.)
+    RPC_WALLET_INSUFFICIENT_FUNDS   = -6,  // Not enough funds in wallet or account
+    RPC_WALLET_INVALID_ACCOUNT_NAME = -11, // Invalid account name
+    RPC_WALLET_KEYPOOL_RAN_OUT      = -12, // Keypool ran out, call keypoolrefill first
+    RPC_WALLET_UNLOCK_NEEDED        = -13, // Enter the wallet passphrase with walletpassphrase first
+    RPC_WALLET_PASSPHRASE_INCORRECT = -14, // The wallet passphrase entered was incorrect
+    RPC_WALLET_WRONG_ENC_STATE      = -15, // Command given in wrong wallet encryption state (encrypting an encrypted wallet etc.)
+    RPC_WALLET_ENCRYPTION_FAILED    = -16, // Failed to encrypt the wallet
+    RPC_WALLET_ALREADY_UNLOCKED     = -17, // Wallet is already unlocked
 };
 
+json_spirit::Object JSONRPCError(int code, const std::string& message);
 
-/** C++ wrapper for BIGNUM (OpenSSL bignum) */
-class CBigNum
+void ThreadRPCServer(void* parg);
+int CommandLineRPC(int argc, char *argv[]);
+
+/** Convert parameter values for RPC call from strings to command-specific JSON objects. */
+json_spirit::Array RPCConvertValues(const std::string &strMethod, const std::vector<std::string> &strParams);
+
+/*
+  Type-check arguments; throws JSONRPCError if wrong type given. Does not check that
+  the right number of arguments are passed, just that any passed are the correct type.
+  Use like:  RPCTypeCheck(params, boost::assign::list_of(str_type)(int_type)(obj_type));
+*/
+void RPCTypeCheck(const json_spirit::Array& params,
+                  const std::list<json_spirit::Value_type>& typesExpected, bool fAllowNull=false);
+/*
+  Check for expected keys/value types in an Object.
+  Use like: RPCTypeCheck(object, boost::assign::map_list_of("name", str_type)("value", int_type));
+*/
+void RPCTypeCheck(const json_spirit::Object& o,
+                  const std::map<std::string, json_spirit::Value_type>& typesExpected, bool fAllowNull=false);
+
+typedef json_spirit::Value(*rpcfn_type)(const json_spirit::Array& params, bool fHelp);
+
+class CRPCCommand
 {
-protected:
-    BIGNUM  *bn;
-
-    void init()
-    {
-        bn = BN_new();
-    }
-
 public:
-    CBigNum()
-    {
-        init();
-    }
-
-    CBigNum(const CBigNum& b)
-    {
-        init();
-        if (!BN_copy(bn, &b))
-        {
-            BN_clear_free(bn);
-            throw bignum_error("CBigNum::CBigNum(const CBigNum&) : BN_copy failed");
-        }
-    }
-
-    CBigNum& operator=(const CBigNum& b)
-    {
-        if (!BN_copy(bn, &b))
-            throw bignum_error("CBigNum::operator= : BN_copy failed");
-        return (*this);
-    }
-
-    ~CBigNum()
-    {
-        BN_clear_free(bn);
-    }
-    
-    BIGNUM *operator &() const
-    {
-        return bn;
-    }
-
-    CBigNum(signed char n)      { init(); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(short n)            { init(); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(int n)              { init(); if (n >= 0) setulong(n); else setint64(n); }
-//    CBigNum(long n)             { init(); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(int64_t n)            { init(); setint64(n); }
-    CBigNum(unsigned char n)    { init(); setulong(n); }
-    CBigNum(unsigned short n)   { init(); setulong(n); }
-    CBigNum(unsigned int n)     { init(); setulong(n); }
-//    CBigNum(unsigned long n)    { init(); setulong(n); }
-    CBigNum(uint64_t n)           { init(); setuint64(n); }
-    CBigNum(long long int n)      { init(); setuint64(n); }
-    explicit CBigNum(uint256 n) { init(); setuint256(n); }
-
-    //CBigNum(char n) is not portable.  Use 'signed char' or 'unsigned char'.
-/*    CBigNum(signed char n)      { BN_init(this); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(short n)            { BN_init(this); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(int n)              { BN_init(this); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(long n)             { BN_init(this); if (n >= 0) setulong(n); else setint64(n); }
-    CBigNum(int64 n)            { BN_init(this); setint64(n); }
-    CBigNum(unsigned char n)    { BN_init(this); setulong(n); }
-    CBigNum(unsigned short n)   { BN_init(this); setulong(n); }
-    CBigNum(unsigned int n)     { BN_init(this); setulong(n); }
-    CBigNum(unsigned long n)    { BN_init(this); setulong(n); }
-    CBigNum(uint64 n)           { BN_init(this); setuint64(n); }
-    */
-//    explicit CBigNum(uint256 n) { BN_init(this); setuint256(n); }
-
-    explicit CBigNum(const std::vector<unsigned char>& vch)
-    {
-        init();
-        setvch(vch);
-    }
-
-    void setulong(unsigned long n)
-    {
-        if (!BN_set_word(bn, n))
-            throw bignum_error("CBigNum conversion from unsigned long : BN_set_word failed");
-    }
-
-    unsigned long getulong() const
-    {
-        return BN_get_word(bn);
-    }
-
-    unsigned int getuint() const
-    {
-        return BN_get_word(bn);
-    }
-
-    int getint() const
-    {
-        unsigned long n = BN_get_word(bn);
-        if (!BN_is_negative(bn))
-            return (n > (unsigned long)std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : n);
-        else
-            return (n > (unsigned long)std::numeric_limits<int>::max() ? std::numeric_limits<int>::min() : -(int)n);
-    }
-
-    void setint64(int64 sn)
-    {
-        unsigned char pch[sizeof(sn) + 6];
-        unsigned char* p = pch + 4;
-        bool fNegative;
-        uint64 n;
-
-        if (sn < (int64)0)
-        {
-            // Since the minimum signed integer cannot be represented as positive so long as its type is signed, and it's not well-defined what happens if you make it unsigned before negating it, we instead increment the negative integer by 1, convert it, then increment the (now positive) unsigned integer by 1 to compensate
-            n = -(sn + 1);
-            ++n;
-            fNegative = true;
-        } else {
-            n = sn;
-            fNegative = false;
-        }
-
-        bool fLeadingZeroes = true;
-        for (int i = 0; i < 8; i++)
-        {
-            unsigned char c = (n >> 56) & 0xff;
-            n <<= 8;
-            if (fLeadingZeroes)
-            {
-                if (c == 0)
-                    continue;
-                if (c & 0x80)
-                    *p++ = (fNegative ? 0x80 : 0);
-                else if (fNegative)
-                    c |= 0x80;
-                fLeadingZeroes = false;
-            }
-            *p++ = c;
-        }
-        unsigned int nSize = p - (pch + 4);
-        pch[0] = (nSize >> 24) & 0xff;
-        pch[1] = (nSize >> 16) & 0xff;
-        pch[2] = (nSize >> 8) & 0xff;
-        pch[3] = (nSize) & 0xff;
-        BN_mpi2bn(pch, p - pch, bn);
-    }
-
-    uint64 getuint64()
-    {
-        unsigned int nSize = BN_bn2mpi(bn, NULL);
-        if (nSize < 4)
-            return 0;
-        std::vector<unsigned char> vch(nSize);
-        BN_bn2mpi(bn, &vch[0]);
-        if (vch.size() > 4)
-            vch[4] &= 0x7f;
-        uint64 n = 0;
-        for (unsigned int i = 0, j = vch.size()-1; i < sizeof(n) && j >= 4; i++, j--)
-            ((unsigned char*)&n)[i] = vch[j];
-        return n;
-    }
-
-    void setuint64(uint64 n)
-    {
-        unsigned char pch[sizeof(n) + 6];
-        unsigned char* p = pch + 4;
-        bool fLeadingZeroes = true;
-        for (int i = 0; i < 8; i++)
-        {
-            unsigned char c = (n >> 56) & 0xff;
-            n <<= 8;
-            if (fLeadingZeroes)
-            {
-                if (c == 0)
-                    continue;
-                if (c & 0x80)
-                    *p++ = 0;
-                fLeadingZeroes = false;
-            }
-            *p++ = c;
-        }
-        unsigned int nSize = p - (pch + 4);
-        pch[0] = (nSize >> 24) & 0xff;
-        pch[1] = (nSize >> 16) & 0xff;
-        pch[2] = (nSize >> 8) & 0xff;
-        pch[3] = (nSize) & 0xff;
-        BN_mpi2bn(pch, p - pch, bn);
-    }
-
-    void setuint256(uint256 n)
-    {
-        unsigned char pch[sizeof(n) + 6];
-        unsigned char* p = pch + 4;
-        bool fLeadingZeroes = true;
-        unsigned char* pbegin = (unsigned char*)&n;
-        unsigned char* psrc = pbegin + sizeof(n);
-        while (psrc != pbegin)
-        {
-            unsigned char c = *(--psrc);
-            if (fLeadingZeroes)
-            {
-                if (c == 0)
-                    continue;
-                if (c & 0x80)
-                    *p++ = 0;
-                fLeadingZeroes = false;
-            }
-            *p++ = c;
-        }
-        unsigned int nSize = p - (pch + 4);
-        pch[0] = (nSize >> 24) & 0xff;
-        pch[1] = (nSize >> 16) & 0xff;
-        pch[2] = (nSize >> 8) & 0xff;
-        pch[3] = (nSize >> 0) & 0xff;
-        BN_mpi2bn(pch, p - pch, bn);
-    }
-
-    uint256 getuint256()
-    {
-        unsigned int nSize = BN_bn2mpi(bn, NULL);
-        if (nSize < 4)
-            return 0;
-        std::vector<unsigned char> vch(nSize);
-        BN_bn2mpi(bn, &vch[0]);
-        if (vch.size() > 4)
-            vch[4] &= 0x7f;
-        uint256 n = 0;
-        for (unsigned int i = 0, j = vch.size()-1; i < sizeof(n) && j >= 4; i++, j--)
-            ((unsigned char*)&n)[i] = vch[j];
-        return n;
-    }
-
-
-    void setvch(const std::vector<unsigned char>& vch)
-    {
-        std::vector<unsigned char> vch2(vch.size() + 4);
-        unsigned int nSize = vch.size();
-        // BIGNUM's byte stream format expects 4 bytes of
-        // big endian size data info at the front
-        vch2[0] = (nSize >> 24) & 0xff;
-        vch2[1] = (nSize >> 16) & 0xff;
-        vch2[2] = (nSize >> 8) & 0xff;
-        vch2[3] = (nSize >> 0) & 0xff;
-        // swap data to big endian
-        reverse_copy(vch.begin(), vch.end(), vch2.begin() + 4);
-        BN_mpi2bn(&vch2[0], vch2.size(), bn);
-    }
-
-    std::vector<unsigned char> getvch() const
-    {
-        unsigned int nSize = BN_bn2mpi(bn, NULL);
-        if (nSize <= 4)
-            return std::vector<unsigned char>();
-        std::vector<unsigned char> vch(nSize);
-        BN_bn2mpi(bn, &vch[0]);
-        vch.erase(vch.begin(), vch.begin() + 4);
-        reverse(vch.begin(), vch.end());
-        return vch;
-    }
-
-    CBigNum& SetCompact(unsigned int nCompact)
-    {
-        unsigned int nSize = nCompact >> 24;
-        std::vector<unsigned char> vch(4 + nSize);
-        vch[3] = nSize;
-        if (nSize >= 1) vch[4] = (nCompact >> 16) & 0xff;
-        if (nSize >= 2) vch[5] = (nCompact >> 8) & 0xff;
-        if (nSize >= 3) vch[6] = (nCompact >> 0) & 0xff;
-        BN_mpi2bn(&vch[0], vch.size(), bn);
-        return *this;
-    }
-
-    unsigned int GetCompact() const
-    {
-        unsigned int nSize = BN_bn2mpi(bn, NULL);
-        std::vector<unsigned char> vch(nSize);
-        nSize -= 4;
-        BN_bn2mpi(bn, &vch[0]);
-        unsigned int nCompact = nSize << 24;
-        if (nSize >= 1) nCompact |= (vch[4] << 16);
-        if (nSize >= 2) nCompact |= (vch[5] << 8);
-        if (nSize >= 3) nCompact |= (vch[6] << 0);
-        return nCompact;
-    }
-
-    void SetHex(const std::string& str)
-    {
-        // skip 0x
-        const char* psz = str.c_str();
-        while (isspace(*psz))
-            psz++;
-        bool fNegative = false;
-        if (*psz == '-')
-        {
-            fNegative = true;
-            psz++;
-        }
-        if (psz[0] == '0' && tolower(psz[1]) == 'x')
-            psz += 2;
-        while (isspace(*psz))
-            psz++;
-
-        // hex string to bignum
-        static const signed char phexdigit[256] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,1,2,3,4,5,6,7,8,9,0,0,0,0,0,0, 0,0xa,0xb,0xc,0xd,0xe,0xf,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0xa,0xb,0xc,0xd,0xe,0xf,0,0,0,0,0,0,0,0,0 };
-        *this = 0;
-        while (isxdigit(*psz))
-        {
-            *this <<= 4;
-            int n = phexdigit[(unsigned char)*psz++];
-            *this += n;
-        }
-        if (fNegative)
-            *this = 0 - *this;
-    }
-
-    std::string ToString(int nBase=10) const
-    {
-        CAutoBN_CTX pctx;
-        CBigNum bnBase = nBase;
-        CBigNum bn0 = 0;
-        std::string str;
-        CBigNum bn1 = *this;
-        BN_set_negative(&bn1, false);
-        CBigNum dv;
-        CBigNum rem;
-        if (BN_cmp(&bn1, &bn0) == 0)
-            return "0";
-        while (BN_cmp(&bn1, &bn0) > 0)
-        {
-            if (!BN_div(&dv, &rem, &bn1, &bnBase, pctx))
-                throw bignum_error("CBigNum::ToString() : BN_div failed");
-            bn1 = dv;
-            unsigned int c = rem.getulong();
-            str += "0123456789abcdef"[c];
-        }
-        if (BN_is_negative(bn))
-            str += "-";
-        reverse(str.begin(), str.end());
-        return str;
-    }
-
-    std::string GetHex() const
-    {
-        return ToString(16);
-    }
-
-    unsigned int GetSerializeSize(int nType=0, int nVersion=PROTOCOL_VERSION) const
-    {
-        return ::GetSerializeSize(getvch(), nType, nVersion);
-    }
-
-    template<typename Stream>
-    void Serialize(Stream& s, int nType=0, int nVersion=PROTOCOL_VERSION) const
-    {
-        ::Serialize(s, getvch(), nType, nVersion);
-    }
-
-    template<typename Stream>
-    void Unserialize(Stream& s, int nType=0, int nVersion=PROTOCOL_VERSION)
-    {
-        std::vector<unsigned char> vch;
-        ::Unserialize(s, vch, nType, nVersion);
-        setvch(vch);
-    }
-
-
-    bool operator!() const
-    {
-        return BN_is_zero(bn);
-    }
-
-    CBigNum& operator+=(const CBigNum& b)
-    {
-        if (!BN_add(bn, bn, &b))
-            throw bignum_error("CBigNum::operator+= : BN_add failed");
-        return *this;
-    }
-
-    CBigNum& operator-=(const CBigNum& b)
-    {
-        *this = *this - b;
-        return *this;
-    }
-
-    CBigNum& operator*=(const CBigNum& b)
-    {
-        CAutoBN_CTX pctx;
-        if (!BN_mul(bn, bn, &b, pctx))
-            throw bignum_error("CBigNum::operator*= : BN_mul failed");
-        return *this;
-    }
-
-    CBigNum& operator/=(const CBigNum& b)
-    {
-        *this = *this / b;
-        return *this;
-    }
-
-    CBigNum& operator%=(const CBigNum& b)
-    {
-        *this = *this % b;
-        return *this;
-    }
-
-    CBigNum& operator<<=(unsigned int shift)
-    {
-        if (!BN_lshift(bn, bn, shift))
-            throw bignum_error("CBigNum:operator<<= : BN_lshift failed");
-        return *this;
-    }
-
-    CBigNum& operator>>=(unsigned int shift)
-    {
-        // Note: BN_rshift segfaults on 64-bit if 2^shift is greater than the number
-        //   if built on ubuntu 9.04 or 9.10, probably depends on version of OpenSSL
-        CBigNum a = 1;
-        a <<= shift;
-        if (BN_cmp(&a, bn) > 0)
-        {
-            *this = 0;
-            return *this;
-        }
-
-        if (!BN_rshift(bn, bn, shift))
-            throw bignum_error("CBigNum:operator>>= : BN_rshift failed");
-        return *this;
-    }
-
-
-    CBigNum& operator++()
-    {
-        // prefix operator
-        if (!BN_add(bn, bn, BN_value_one()))
-            throw bignum_error("CBigNum::operator++ : BN_add failed");
-        return *this;
-    }
-
-    const CBigNum operator++(int)
-    {
-        // postfix operator
-        const CBigNum ret = *this;
-        ++(*this);
-        return ret;
-    }
-
-    CBigNum& operator--()
-    {
-        // prefix operator
-        CBigNum r;
-        if (!BN_sub(&r, bn, BN_value_one()))
-            throw bignum_error("CBigNum::operator-- : BN_sub failed");
-        *this = r;
-        return *this;
-    }
-
-    const CBigNum operator--(int)
-    {
-        // postfix operator
-        const CBigNum ret = *this;
-        --(*this);
-        return ret;
-    }
-
-
-    friend inline const CBigNum operator-(const CBigNum& a, const CBigNum& b);
-    friend inline const CBigNum operator/(const CBigNum& a, const CBigNum& b);
-    friend inline const CBigNum operator%(const CBigNum& a, const CBigNum& b);
+    std::string name;
+    rpcfn_type actor;
+    bool okSafeMode;
+    bool unlocked;
 };
 
-
-
-inline const CBigNum operator+(const CBigNum& a, const CBigNum& b)
+/**
+ * curecoin RPC command dispatcher.
+ */
+class CRPCTable
 {
-    CBigNum r;
-    if (!BN_add(&r, &a, &b))
-        throw bignum_error("CBigNum::operator+ : BN_add failed");
-    return r;
-}
+private:
+    std::map<std::string, const CRPCCommand*> mapCommands;
+public:
+    CRPCTable();
+    const CRPCCommand* operator[](std::string name) const;
+    std::string help(std::string name) const;
 
-inline const CBigNum operator-(const CBigNum& a, const CBigNum& b)
-{
-    CBigNum r;
-    if (!BN_sub(&r, &a, &b))
-        throw bignum_error("CBigNum::operator- : BN_sub failed");
-    return r;
-}
+    /**
+     * Execute a method.
+     * @param method   Method to execute
+     * @param params   Array of arguments (JSON objects)
+     * @returns Result of the call.
+     * @throws an exception (json_spirit::Value) when an error happens.
+     */
+    json_spirit::Value execute(const std::string &method, const json_spirit::Array &params) const;
+};
 
-inline const CBigNum operator-(const CBigNum& a)
-{
-    CBigNum r(a);
-    BN_set_negative(&r, !BN_is_negative(&r));
-    return r;
-}
+extern const CRPCTable tableRPC;
 
-inline const CBigNum operator*(const CBigNum& a, const CBigNum& b)
-{
-    CAutoBN_CTX pctx;
-    CBigNum r;
-    if (!BN_mul(&r, &a, &b, pctx))
-        throw bignum_error("CBigNum::operator* : BN_mul failed");
-    return r;
-}
+extern int64 nWalletUnlockTime;
+extern int64 AmountFromValue(const json_spirit::Value& value);
+extern json_spirit::Value ValueFromAmount(int64 amount);
+extern double GetDifficulty(const CBlockIndex* blockindex = NULL);
+extern std::string HexBits(unsigned int nBits);
+extern std::string HelpRequiringPassphrase();
+extern void EnsureWalletIsUnlocked();
 
-inline const CBigNum operator/(const CBigNum& a, const CBigNum& b)
-{
-    CAutoBN_CTX pctx;
-    CBigNum r;
-    if (!BN_div(&r, NULL, &a, &b, pctx))
-        throw bignum_error("CBigNum::operator/ : BN_div failed");
-    return r;
-}
+extern double GetPoSKernelPS();
 
-inline const CBigNum operator%(const CBigNum& a, const CBigNum& b)
-{
-    CAutoBN_CTX pctx;
-    CBigNum r;
-    if (!BN_mod(&r, &a, &b, pctx))
-        throw bignum_error("CBigNum::operator% : BN_div failed");
-    return r;
-}
+extern json_spirit::Value getconnectioncount(const json_spirit::Array& params, bool fHelp); // in rpcnet.cpp
+extern json_spirit::Value getpeerinfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value dumpprivkey(const json_spirit::Array& params, bool fHelp); // in rpcdump.cpp
+extern json_spirit::Value importprivkey(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value sendalert(const json_spirit::Array& params, bool fHelp);
 
-inline const CBigNum operator<<(const CBigNum& a, unsigned int shift)
-{
-    CBigNum r;
-    if (!BN_lshift(&r, &a, shift))
-        throw bignum_error("CBigNum:operator<< : BN_lshift failed");
-    return r;
-}
+extern json_spirit::Value getgenerate(const json_spirit::Array& params, bool fHelp); // in rpcmining.cpp
+extern json_spirit::Value setgenerate(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value gethashespersec(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getmininginfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getnetworkhashps(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getwork(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getworkex(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getblocktemplate(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value submitblock(const json_spirit::Array& params, bool fHelp);
 
-inline const CBigNum operator>>(const CBigNum& a, unsigned int shift)
-{
-    CBigNum r = a;
-    r >>= shift;
-    return r;
-}
+extern json_spirit::Value getnewaddress(const json_spirit::Array& params, bool fHelp); // in rpcwallet.cpp
+extern json_spirit::Value getaccountaddress(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value setaccount(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getaccount(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getaddressesbyaccount(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value sendtoaddress(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value signmessage(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value verifymessage(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getreceivedbyaddress(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getreceivedbyaccount(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getbalance(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value movecmd(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value sendfrom(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value sendmany(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value addmultisigaddress(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listreceivedbyaddress(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listreceivedbyaccount(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listtransactions(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listaddressgroupings(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listaccounts(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value listsinceblock(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value gettransaction(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value backupwallet(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value keypoolrefill(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value walletpassphrase(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value walletpassphrasechange(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value walletlock(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value encryptwallet(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value validateaddress(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getinfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value reservebalance(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value checkwallet(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value repairwallet(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value resendtx(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value makekeypair(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value validatepubkey(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getnewpubkey(const json_spirit::Array& params, bool fHelp);
 
-inline bool operator==(const CBigNum& a, const CBigNum& b) { return (BN_cmp(&a, &b) == 0); }
-inline bool operator!=(const CBigNum& a, const CBigNum& b) { return (BN_cmp(&a, &b) != 0); }
-inline bool operator<=(const CBigNum& a, const CBigNum& b) { return (BN_cmp(&a, &b) <= 0); }
-inline bool operator>=(const CBigNum& a, const CBigNum& b) { return (BN_cmp(&a, &b) >= 0); }
-inline bool operator<(const CBigNum& a, const CBigNum& b)  { return (BN_cmp(&a, &b) < 0); }
-inline bool operator>(const CBigNum& a, const CBigNum& b)  { return (BN_cmp(&a, &b) > 0); }
+extern json_spirit::Value getrawtransaction(const json_spirit::Array& params, bool fHelp); // in rcprawtransaction.cpp
+extern json_spirit::Value listunspent(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value createrawtransaction(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value decoderawtransaction(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value signrawtransaction(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value sendrawtransaction(const json_spirit::Array& params, bool fHelp);
+
+extern json_spirit::Value getblockcount(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
+extern json_spirit::Value getdifficulty(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value settxfee(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getrawmempool(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getblockhash(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getblock(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getblockbynumber(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getcheckpoint(const json_spirit::Array& params, bool fHelp);
 
 #endif
